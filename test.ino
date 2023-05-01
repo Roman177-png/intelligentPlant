@@ -1,18 +1,26 @@
 #include <M5Core2.h>
 #include <M5_ENV.h>
 #include <SD.h>
+#include <EEPROM.h>
 
+RTC_TimeTypeDef RTCtime;
+RTC_DateTypeDef RTCDate;
+char timeStrbuff[64];
+
+
+float tempAvg = 0, humAvg = 0, soilHumAvg = 0, pressAvg = 0;
 const unsigned long SOIL_MOISTURE_INTERVAL = 1000;
-const int SOIL_MOISTURE_THRESHOLD = 1850;
+const int SOIL_MOISTURE_THRESHOLD = 1700;
 
 void page1a();
-void page1b();  
-void page2();   
-void page3();   
-void page4();   
+void page1b();
+void page2();
+void page3();
+void page4();
 void page5();
 void clearScreen();
 
+void draw_switch_button();
 
 TouchPoint_t touchPos;      // Pozycja punktu dotyku
 bool touchPressed = false;  // Czy ekran jest wciśnięty?
@@ -23,7 +31,7 @@ File dataFile;
 char fileName[] = "/data2.txt";
 SHT3X sht30;
 QMP6988 qmp6988;
-unsigned long now = 0, last = 0, nowPump = 0, pumpStartTime = 0, lastPump = 0;
+unsigned long now = 0, last = 0, nowPump = 0, pumpStartTime = 0, lastPump = 0, avrNow = 0, avrLast = 0;
 float temperature = 0.0;
 float humidity = 0.0;
 float pressure = 0.0;
@@ -43,6 +51,33 @@ Button lt(14, 42, 110, 30, "left-top");
 Button lb(177, 42, 110, 30, "left-bottom");
 
 boolean isButtonPressed = false;
+
+float avg_temperature = 0, avg_pressure = 0, avg_humidity = 0, avg_soil_moisture = 0;
+
+unsigned long lastWateringTime = 0;
+int lastWateringDay = 0;
+
+void flushTime() {
+  M5.Rtc.GetTime(&RTCtime);
+  M5.Rtc.GetDate(&RTCDate);
+  sprintf(timeStrbuff, "%d/%02d/%02d %02d:%02d:%02d", RTCDate.Year,
+          RTCDate.Month, RTCDate.Date, RTCtime.Hours, RTCtime.Minutes,
+          RTCtime.Seconds);
+  M5.Lcd.setCursor(10, 100);
+  M5.Lcd.println(timeStrbuff);
+}
+
+void setupTime() {
+  RTCtime.Hours = 01;
+  RTCtime.Minutes = 00;
+  RTCtime.Seconds = 20;
+  if (!M5.Rtc.SetTime(&RTCtime)) Serial.println("wrong time set!");
+  RTCDate.Year = 2023;
+  RTCDate.Month = 05;
+  RTCDate.Date = 02;
+  if (!M5.Rtc.SetDate(&RTCDate)) Serial.println("wrong date set!");
+}
+
 void colorButtons(Event& e) {
   Button& b = *e.button;
   if (!isButtonPressed) {
@@ -143,22 +178,22 @@ void lbClick(Event& e) {
 
 void setup() {
   M5.begin();
+  setupTime();
 
   M5.Lcd.setTextSize(2);
   M5.Lcd.setTextColor(WHITE);
   M5.Lcd.fillScreen(BLACK);
-
+  lastWateringDay = EEPROM.read(0);
+  EEPROM.get(1, lastWateringTime);
+  Serial.print("Last watering time: ");
+  Serial.print(lastWateringDay);
+  Serial.print(", ");
+  Serial.println(lastWateringTime);
   SD.begin(TFCARD_CS_PIN, SPI, 40000000);
   Wire.begin();
   qmp6988.init();
 
-
-  dataFile = SD.open("/data2.txt", FILE_WRITE);
-  if (dataFile) {
-    dataFile.println("Temperature, Humidity, Pressure");
-    dataFile.close();
-  }
-
+  Serial.begin(9600);
   pinMode(INPUT_PIN, INPUT);
   pinMode(PUMP_PIN, OUTPUT);
   pinMode(25, OUTPUT);
@@ -174,6 +209,7 @@ void setup() {
 
 void loop() {
   M5.update();
+  //  flushTime();
   now = millis();
   if (now - last > 1000) {
     last = now;
@@ -184,24 +220,80 @@ void loop() {
     } else {
       temperature = 0.0, humidity = 0.0;
     }
+
+
+    rawADC = analogRead(INPUT_PIN);
+    if (rawADC < SOIL_MOISTURE_THRESHOLD) {
+      digitalWrite(PUMP_PIN, HIGH);
+      lastWateringDay = RTCDate.Date;
+      lastWateringTime = millis();
+      EEPROM.write(0, lastWateringDay);
+      EEPROM.put(1, lastWateringTime);
+      EEPROM.commit();
+      Serial.print("Watering time saved: ");
+      Serial.print(lastWateringDay);
+      Serial.print(", ");
+      Serial.println(lastWateringTime);
+      pumpStartTime = millis();
+      pumpRunning = true;
+    }
+
+    //zapis do pliku
+    dataFile = SD.open("/daneToday2.txt", FILE_WRITE);
+
+    if (dataFile) {
+      dataFile.print(temperature);
+      dataFile.print(",");
+      dataFile.print(humidity);
+      dataFile.print(",");
+      dataFile.print(rawADC);
+      dataFile.print(",");
+      dataFile.println(pressure / 100);
+      dataFile.close();
+    } else {
+      Serial.println("Błąd otwarcia pliku!");
+    }
   }
   // Przechodzenie do następnego ekranu za pomocą przycisku A
   if (buttonsEnabled) {
     if (M5.BtnB.wasPressed()) {
       digitalWrite(PUMP_PIN, flag);
+      lastWateringDay = RTCDate.Date;
+      lastWateringTime = millis();
+      EEPROM.write(0, lastWateringDay);
+      EEPROM.put(1, lastWateringTime);
+      EEPROM.commit();
+      Serial.print("Watering time saved: ");
+      Serial.print(lastWateringDay);
+      Serial.print(", ");
+      Serial.println(lastWateringTime);
       flag = !flag;
     }
-    nowPump = millis();
-    if (nowPump - lastPump > SOIL_MOISTURE_INTERVAL) {
-      rawADC = analogRead(INPUT_PIN);
-      if (rawADC < SOIL_MOISTURE_THRESHOLD) {
-        digitalWrite(PUMP_PIN, HIGH);
-        pumpStartTime = millis();
-        pumpRunning = true;
-      }
-      lastPump = nowPump;
-    }
-    if (pumpRunning && millis() - pumpStartTime >= 10000) {
+    // nowPump = millis();
+    // if (nowPump - lastPump > SOIL_MOISTURE_INTERVAL) {
+    //   rawADC = analogRead(INPUT_PIN);
+    //   if (rawADC < SOIL_MOISTURE_THRESHOLD) {
+    //     digitalWrite(PUMP_PIN, HIGH);
+    //     lastWateringDay = RTCDate.Date;
+    //     lastWateringTime = millis();
+    //     EEPROM.write(0, lastWateringDay);
+    //     EEPROM.put(1, lastWateringTime);
+    //     EEPROM.commit();
+    //     Serial.print("Watering time saved: ");
+    //     Serial.print(lastWateringDay);
+    //     Serial.print(", ");
+    //     Serial.println(lastWateringTime);
+    //     pumpStartTime = millis();
+    //     pumpRunning = true;
+    //   }
+    //   lastPump = nowPump;
+    //   dataFile.print("Wilgotnosc gleby: ");
+    //   dataFile.print(rawADC);
+    //   dataFile.print(" %\n");
+    //   dataFile.close();
+    // }
+    // if (pumpRunning && millis() - pumpStartTime >= 10000) {
+    if (pumpRunning && millis() - pumpStartTime >= 5000) {
       digitalWrite(PUMP_PIN, LOW);  // wyłączamy pompę
       pumpRunning = false;          // ustawiamy flagę, że pompa jest wyłączona
     }
@@ -242,6 +334,7 @@ void loop() {
       }
       refresh = 1;
     }
+    odczytajIZapiszSrednia();
   }
 }
 void page1a() {
@@ -340,13 +433,13 @@ void page2() {
     M5.Lcd.setCursor(20, 140);          // Ustaw pozycję kursora
     M5.Lcd.setTextColor(WHITE, BLACK);
 
-    M5.Lcd.printf("Temper:%.1f C", temperature);  // Wypisz tekst na ekranie
+    M5.Lcd.printf("Temperat:%.1f C", temperature);  // Wypisz tekst na ekranie
 
-    M5.Lcd.setCursor(20, 170);                    // Ustaw pozycję kursora
+    M5.Lcd.setCursor(20, 170);  // Ustaw pozycję kursora
     M5.Lcd.setTextColor(WHITE, BLACK);
 
     M5.Lcd.printf("Pressure:%.1f", pressure / 100);  // Wypisz tekst na ekranie
-    M5.Lcd.setCursor(20, 193);                           // Ustaw pozycję kursora
+    M5.Lcd.setCursor(20, 200);                       // Ustaw pozycję kursora
     M5.Lcd.setTextColor(WHITE, BLACK);
 
     M5.Lcd.printf("Humadity:%.1f%%", humidity);  // Wypisz tekst na ekranie
@@ -362,12 +455,12 @@ void page2() {
     M5.Lcd.setCursor(29, 140);  // Ustaw pozycję kursora
     M5.Lcd.setTextColor(WHITE, BLACK);
 
-    M5.Lcd.printf("Temper: %.1f C", temperature);  // Wypisz tekst na ekranie
-    M5.Lcd.setCursor(29, 170);                     // Ustaw pozycję kursora
+    M5.Lcd.printf("Temperat: %.1f C", temperature);  // Wypisz tekst na ekranie
+    M5.Lcd.setCursor(29, 170);                       // Ustaw pozycję kursora
     M5.Lcd.setTextColor(WHITE, BLACK);
 
     M5.Lcd.printf("Pressure: %.1f", pressure / 100);  // Wypisz tekst na ekranie
-    M5.Lcd.setCursor(29, 193);                        // Ustaw pozycję kursora
+    M5.Lcd.setCursor(29, 200);                        // Ustaw pozycję kursora
     M5.Lcd.setTextColor(WHITE, BLACK);
     M5.Lcd.printf("Humadity: %.1f%%", humidity);
   }
@@ -381,9 +474,27 @@ void page3() {
   M5.Lcd.setCursor(24, 24);
   M5.Lcd.setTextColor(WHITE, BLACK);
   M5.Lcd.print("Last water");
+  M5.Lcd.setTextSize(3);
   M5.Lcd.setCursor(84, 76);
   M5.Lcd.setTextColor(WHITE, BLACK);
-  M5.Lcd.print("11:00");
+
+  M5.Lcd.print(lastWateringDay);
+  M5.Lcd.print("/");
+  M5.Lcd.setTextColor(WHITE, BLACK);
+
+  M5.Lcd.print(RTCDate.Month);
+  M5.Lcd.print("/");
+  M5.Lcd.setTextColor(WHITE, BLACK);
+
+  M5.Lcd.print(RTCDate.Year);
+  M5.Lcd.print(" ");
+  M5.Lcd.setTextColor(WHITE, BLACK);
+
+  //M5.Lcd.print(lastWateringTime / 1000 / 60 / 60);
+  //  M5.Lcd.print(":");
+  M5.Lcd.setTextColor(WHITE, BLACK);
+
+  //M5.Lcd.print((lastWateringTime / 1000 / 60) % 60);
 
   M5.Lcd.fillCircle(39, 91, 15, BLUE);
   M5.Lcd.fillRect(31, 52, 15, 30, BLUE);
@@ -395,13 +506,16 @@ void page3() {
 
 
   M5.Lcd.setTextColor(WHITE, BLACK);
+  M5.Lcd.setTextSize(2);
   M5.Lcd.setCursor(17, 134);
   M5.Lcd.print("Soil moisture");
+  M5.Lcd.setTextSize(3);
   M5.Lcd.setCursor(76, 175);
   M5.Lcd.setTextColor(WHITE, BLACK);
   M5.Lcd.print(String(rawADC));
   M5.Lcd.fillRect(24, 180, 10, 30, BLUE);
   M5.Lcd.fillRect(44, 180, 10, 30, YELLOW);
+  draw_switch_button();
 }
 void page4() {
 
@@ -412,48 +526,85 @@ void page4() {
   M5.Lcd.drawLine(150, 237, 150, 5, BLACK);
 
   M5.Lcd.drawJpgFile(SD, "/a1.jpg", 43, 11);
-  M5.Lcd.setTextColor(BLACK, WHITE);  // Ustaw kolor tekstu na biały
   M5.Lcd.setTextSize(2);              // Ustaw rozmiar czcionki
-  M5.Lcd.setCursor(12, 53);           // Ustaw pozycję kursora
-  M5.Lcd.print("24.3 ");              // Wypisz tekst na ekranie
+  M5.Lcd.setCursor(10, 53);           // Ustaw pozycję kursora
+  M5.Lcd.setTextColor(BLACK, WHITE);  // Ustaw kolor tekstu na biały
+
+  int intTempAvg = int(tempAvg);
+  M5.Lcd.print(intTempAvg);
+//  M5.Lcd.printf("%.1f", tempAvg);
+  //M5.Lcd.print("24.3 ");  // Wypisz tekst na ekranie
 
 
   M5.Lcd.drawJpgFile(SD, "/b1.jpg", 156, 11);
   M5.Lcd.setTextColor(BLACK, WHITE);  // Ustaw kolor tekstu na biały
   M5.Lcd.setTextSize(2);              // Ustaw rozmiar czcionki
-  M5.Lcd.setCursor(269, 52);          // Ustaw pozycję kursora
+  M5.Lcd.setCursor(254, 52);          // Ustaw pozycję kursora
   M5.Lcd.setTextColor(BLACK, WHITE);  // Ustaw kolor tekstu na biały
-  M5.Lcd.print("1600");                 // Wypisz tekst na ekranie
+  //M5.Lcd.print(avg_soil_moisture);
+  int iSoilHumAvg = int(soilHumAvg);
+  M5.Lcd.print(iSoilHumAvg);  
+  //M5.Lcd.printf("%.1f", soilHumAvg);
+  //M5.Lcd.print("1600");  // Wypisz tekst na ekranie
 
-  M5.Lcd.drawJpgFile(SD, "/c1.jpg", 39, 123);
+  M5.Lcd.drawJpgFile(SD, "/c1.jpg", 43, 123);
+  M5.Lcd.setTextSize(2);     // Ustaw rozmiar czcionki
+  M5.Lcd.setCursor(7, 165);  // Ustaw pozycję kursora
+
   M5.Lcd.setTextColor(BLACK, WHITE);  // Ustaw kolor tekstu na biały
-  M5.Lcd.setTextSize(2);              // Ustaw rozmiar czcionki
-  M5.Lcd.setCursor(0, 165);          // Ustaw pozycję kursora
-  M5.Lcd.print("978.0");                 // Wypisz tekst na ekranie
 
+  //M5.Lcd.print(avg_pressure);
+  int iPressAvg = int(pressAvg);
+  //M5.Lcd.printf("%.1f", pressAvg);
+  //M5.Lcd.print("978.0");  // Wypisz tekst na ekranie
+  M5.Lcd.print(iPressAvg);
   M5.Lcd.drawJpgFile(SD, "/d1.jpg", 156, 123);
   M5.Lcd.setTextColor(BLACK, WHITE);  // Ustaw kolor tekstu na biały
   M5.Lcd.setTextSize(2);              // Ustaw rozmiar czcionki
-  M5.Lcd.setCursor(260, 165);         // Ustaw pozycję kursora
-  M5.Lcd.print("43.0");               // Wypisz tekst na ekranie
+  M5.Lcd.setCursor(258, 165);         // Ustaw pozycję kursora
+  //M5.Lcd.print(avg_humidity);
+  int intHumAvg = int(humAvg);
+  M5.Lcd.print(intHumAvg);
+  //M5.Lcd.printf("%.1f", humAvg);
+  //M5.Lcd.print("43.0");  // Wypisz tekst na ekranie
 }
 void page5() {
   clearScreen();
   if (temperature >= 10 && temperature <= 20) {
+    M5.Lcd.drawRoundRect(45, 70, 255, 120, 20, WHITE);  // rysowanie przycisku z zielonym kolorem
     M5.Lcd.setTextColor(BLACK, GREEN);
-    M5.Lcd.setTextSize(3);
-    M5.Lcd.setCursor(5, 100);
-    M5.Lcd.printf("Temperat w normie:%.1fC", temperature);
-  } else if (temperature >= 21 && temperature <= 25) {
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(100, 86);
+    M5.Lcd.print("Temperatura");
+    M5.Lcd.setCursor(50, 106);
+    M5.Lcd.print(" w normie:");
+    M5.Lcd.setTextSize(4);
+    M5.Lcd.setCursor(113, 143);
+    M5.Lcd.printf("%.1fC", temperature);
+  } else if (temperature >= 21 && temperature <= 27) {
+    M5.Lcd.drawRoundRect(45, 70, 255, 120, 20, WHITE);  // rysowanie przycisku z zielonym kolorem
     M5.Lcd.setTextColor(BLACK, ORANGE);
-    M5.Lcd.setCursor(5, 100);
-    M5.Lcd.setTextSize(3);
-    M5.Lcd.printf("Temperat lekko przekroczona:%.1fC", temperature);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(100, 86);
+    M5.Lcd.print("Temperatura");
+    M5.Lcd.setCursor(50, 106);
+    M5.Lcd.print(" lekko przekroczona:");
+    M5.Lcd.setTextSize(4);
+    M5.Lcd.setCursor(113, 143);
+    M5.Lcd.printf("%.1fC", temperature);
   } else {
+    M5.Lcd.drawRoundRect(45, 70, 255, 120, 20, WHITE);  // rysowanie przycisku z zielonym kolorem
     M5.Lcd.setTextColor(BLACK, RED);
-    M5.Lcd.setTextSize(3);
-    M5.Lcd.setCursor(5, 100);
-    M5.Lcd.printf("Temperat bardzo wysoka:%.1fC", temperature);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(100, 86);
+    M5.Lcd.print("Temperatura");
+    M5.Lcd.setCursor(50, 106);
+    M5.Lcd.print("bardzo wysoka:");
+    M5.Lcd.setTextSize(4);
+    M5.Lcd.setCursor(113, 143);
+    // M5.Lcd.setTextSize(3);
+    // M5.Lcd.setCursor(5, 100);
+    M5.Lcd.printf("%.1fC", temperature);
   }
 }
 void clearScreen() {
@@ -463,15 +614,86 @@ void clearScreen() {
     } else if (screenNum == 4) {
       if (temperature >= 10 && temperature <= 20) {
         M5.Lcd.fillScreen(GREEN);
-      } else if (temperature >= 21 && temperature <= 25) {
+      } else if (temperature >= 21 && temperature <= 27) {
         M5.Lcd.fillScreen(ORANGE);
 
       } else {
         M5.Lcd.fillScreen(RED);
       }
-    }else{
+    } else {
       M5.Lcd.clear();
     }
     refresh = 0;
+  }
+}
+void draw_switch_button() {
+  //M5.Lcd.fillScreen(BLACK); // wypełnienie ekranu na czarno
+  M5.Lcd.setCursor(242, 165);  // ustawienie kursora
+  M5.Lcd.setTextColor(WHITE);  // ustawienie koloru tekstu na biały
+  M5.Lcd.setTextSize(2);       // ustawienie rozmiaru tekstu na 1
+  M5.Lcd.print("PUMP");        // wyświetlenie napisu "Switch" na przycisku
+  if (flag == 1) {
+    //M5.Lcd.drawRoundRect(100, 80, 80, 40, 10, GREEN); // rysowanie przycisku z zielonym kolorem
+    M5.Lcd.drawRoundRect(224, 188, 80, 40, 20, RED);  // rysowanie przycisku z zielonym kolorem
+    //M5.Lcd.drawRoundRect(100, 80, 80, 40, 10, RED); // rysowanie przycisku z czerwonym kolorem
+    M5.Lcd.setCursor(242, 200);         // ustawienie kursora
+    M5.Lcd.setTextColor(WHITE, BLACK);  // ustawienie koloru tekstu na biały
+    M5.Lcd.setTextSize(3);              // ustawienie rozmiaru tekstu na 1
+    M5.Lcd.print("OFF");                // wyświetlenie napisu "Switch" na przycisku
+  } else {
+    M5.Lcd.drawRoundRect(224, 188, 80, 40, 20, GREEN);  // rysowanie przycisku z zielonym kolorem
+    //M5.Lcd.drawRoundRect(100, 80, 80, 40, 10, RED); // rysowanie przycisku z czerwonym kolorem
+    M5.Lcd.setCursor(242, 200);         // ustawienie kursora
+    M5.Lcd.setTextColor(WHITE, BLACK);  // ustawienie koloru tekstu na biały
+    M5.Lcd.setTextSize(3);              // ustawienie rozmiaru tekstu na 1
+    M5.Lcd.print("ON1");                // wyświetlenie napisu "Switch" na przycisku
+  }
+}
+void odczytajIZapiszSrednia() {
+  File myFile = SD.open("/daneToday2.txt", FILE_READ);
+  if (!myFile) {
+    Serial.println("Nie można otworzyć pliku");
+    return;
+  }
+  float tempSum = 0, humSum = 0, soilHumSum = 0, pressSum = 0;
+  int count = 0;
+  while (myFile.available()) {
+    String line = myFile.readStringUntil('\n');
+    if (line.length() > 0) {
+      float temp, hum, soilHum, press;
+      int pos = line.indexOf(',');
+      temp = line.substring(0, pos).toFloat();
+      line = line.substring(pos + 1);
+      pos = line.indexOf(',');
+      hum = line.substring(0, pos).toFloat();
+      line = line.substring(pos + 1);
+      pos = line.indexOf(',');
+      soilHum = line.substring(0, pos).toFloat();
+      line = line.substring(pos + 1);
+      press = line.toFloat();
+
+      tempSum += temp;
+      humSum += hum;
+      soilHumSum += soilHum;
+      pressSum += press;
+      count++;
+    }
+  }
+  myFile.close();
+  if (count > 0) {
+    avrNow = millis();
+    if (avrNow - avrLast > 10000){
+        avrLast = avrNow;
+        tempAvg = tempSum / count;
+        humAvg = humSum / count;
+        soilHumAvg = soilHumSum / count;
+        pressAvg = pressSum / count;
+        Serial.printf("Średnia temperatura: %.2f C\n", tempAvg);
+        Serial.printf("Średnia wilgotność: %.2f %%\n", humAvg);
+        Serial.printf("Średnia wilgotność gleby: %.2f %%\n", soilHumAvg);
+        Serial.printf("Średnie ciśnienie: %.2f hPa\n", pressAvg);
+      }
+  } else {
+    Serial.println("Brak danych do obliczenia średniej");
   }
 }
